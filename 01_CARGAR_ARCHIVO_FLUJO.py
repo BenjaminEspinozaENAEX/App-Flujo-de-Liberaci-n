@@ -2368,6 +2368,32 @@ def marcar_cambios_guardados(total_cambios: int) -> None:
     )
 
 
+def render_fecha_version(version: dict[str, Any]) -> None:
+    """Muestra la fecha completa de la versión, sin recortarla."""
+    fecha = version.get("fecha_version")
+    if isinstance(fecha, datetime):
+        fecha_texto = fecha.strftime("%d-%m-%Y")
+        hora_texto = fecha.strftime("%H:%M")
+    else:
+        fecha_texto = clean_text(version.get("fecha_corta")) or "—"
+        hora_texto = ""
+
+    st.markdown(
+        f"""
+        <div style="line-height:1.15; padding-top:2px;">
+            <div style="font-size:0.875rem; opacity:0.8;
+                        margin-bottom:6px;">Versión</div>
+            <div style="font-size:clamp(1.35rem, 2.1vw, 2.1rem);
+                        font-weight:400; white-space:nowrap;
+                        overflow:visible;">{fecha_texto}</div>
+            <div style="font-size:0.8rem; opacity:0.65;
+                        margin-top:4px;">{hora_texto}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_boton_guardar(data: dict[str, Any]) -> None:
     file_names = st.session_state.get(SESSION_FILE_KEY, {})
     if not isinstance(file_names, dict):
@@ -3295,12 +3321,9 @@ def render_active_state() -> None:
         ).replace(",", ".")
     )
 
-    summary_metrics = st.columns([1, 1.3, 1, 1, 1])
-    summary_metrics[0].metric(
-        "Versión",
-        version["fecha_corta"],
-        help=version["texto_version"],
-    )
+    summary_metrics = st.columns([1.35, 1.35, 1, 1, 1])
+    with summary_metrics[0]:
+        render_fecha_version(version)
     with summary_metrics[1]:
         render_boton_guardar(data)
     summary_metrics[2].metric(
