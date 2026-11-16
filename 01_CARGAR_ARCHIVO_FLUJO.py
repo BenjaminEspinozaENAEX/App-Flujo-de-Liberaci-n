@@ -2337,14 +2337,15 @@ def nombre_descarga_version(
 # EDICIÓN DE USUARIOS (USER) EN TIEMPO REAL
 # ============================================================
 
-def aplicar_edicion_usuarios(
-    level: int,
-    ediciones: list[tuple[Any, str, str]],
+def reconstruir_version(
+    updated: dict[str, Any],
+    registros: list[dict[str, Any]],
+    origen: str,
 ) -> None:
     """
-    Aplica cambios de la columna User y reconstruye la versión completa
-    con las mismas validaciones de la carga. Registra cada cambio
-    en el archivo de Cambios.
+    Reconstruye la versión completa desde los datos en memoria
+    (incluye lo modificado en la página 03), con las mismas
+    validaciones de la carga, y agrega los registros a Cambios.
     """
     data = st.session_state.get(SESSION_DATA_KEY)
     if not isinstance(data, dict):
@@ -2355,37 +2356,6 @@ def aplicar_edicion_usuarios(
     )
     names = dict(original_names)
 
-    liberators = dict(data.get("liberadores", {}))
-    frame = liberators[level].copy()
-    fecha = ahora_chile()
-    registros: list[dict[str, Any]] = []
-
-    for index, antes, despues in ediciones:
-        row = frame.loc[index]
-        frame.at[index, "User"] = despues
-        registros.append(
-            {
-                "FechaHora": fecha.strftime("%d-%m-%Y %H:%M:%S"),
-                "Usuario": "Edición directa en la app",
-                "CECO": clean_text(row.get("CostCenter", "")),
-                "Desde": clean_text(row.get("TotalCost Bajo", "")),
-                "Hasta": clean_text(row.get("TotalCost Alto", "")),
-                "TipoDoc": clean_text(
-                    row.get("cus_POClasedeDocumento", "")
-                ),
-                "Campo": f"Liberador {level}",
-                "ValorAntes": antes,
-                "ValorDespues": despues,
-                "Nota": "Cambio de usuario liberador",
-            }
-        )
-
-    liberators[level] = frame
-    updated = dict(data)
-    updated["liberadores"] = liberators
-
-    # Se parte siempre de la versión vigente en memoria (incluye lo
-    # modificado en la página 03), no de los archivos originales.
     sources: dict[str, bytes] = {}
     for role in REQUIRED_FILE_ROLES:
         sources[role] = (
@@ -2409,6 +2379,7 @@ def aplicar_edicion_usuarios(
     else:
         previous = pd.DataFrame(columns=CHANGE_COLUMNS)
     previous = previous.fillna("")
+
     all_changes = pd.concat(
         [previous, pd.DataFrame(registros, columns=CHANGE_COLUMNS)],
         ignore_index=True,
@@ -2447,10 +2418,430 @@ def aplicar_edicion_usuarios(
         pd.DataFrame(columns=CHANGE_COLUMNS),
     )
     st.session_state[SESSION_VERSION_KEY] = construir_info_version(
-        fecha,
-        "edición en la app",
+        ahora_chile(),
+        origen,
     )
     st.session_state.pop(SESSION_CASE_KEY, None)
+
+
+def registro_cambio(
+    campo: str,
+    antes: str,
+    despues: str,
+    nota: str,
+    *,
+    ceco: str = "",
+    desde: str = "",
+    hasta: str = "",
+    tipo_doc: str = "",
+) -> dict[str, Any]:
+    return {
+        "FechaHora": ahora_chile().strftime("%d-%m-%Y %H:%M:%S"),
+        "Usuario": "Edición directa en la app",
+        "CECO": ceco,
+        "Desde": desde,
+        "Hasta": hasta,
+        "TipoDoc": tipo_doc,
+        "Campo": campo,
+        "ValorAntes": antes,
+        "ValorDespues": despues,
+        "Nota": nota,
+    }
+
+
+def aplicar_edicion_usuarios(
+    level: int,
+    ediciones: list[tuple[Any, str, str]],
+) -> None:
+    """Aplica cambios de la columna User de un liberador."""
+    data = st.session_state.get(SESSION_DATA_KEY)
+    if not isinstance(data, dict):
+        raise ValueError("No hay una versión activa.")
+
+    liberators = dict(data.get("liberadores", {}))
+    frame = liberators[level].copy()
+    registros: list[dict[str, Any]] = []
+
+    for index, antes, despues in ediciones:
+        row = frame.loc[index]
+        frame.at[index, "User"] = despues
+        registros.append(
+            registro_cambio(
+                f"Liberador {level}",
+                antes,
+                despues,
+                "Cambio de usuario liberador",
+                ceco=clean_text(row.get("CostCenter", "")),
+                desde=clean_text(row.get("TotalCost Bajo", "")),
+                hasta=clean_text(row.get("TotalCost Alto", "")),
+                tipo_doc=clean_text(row.get("cus_POClasedeDocumento", "")),
+            )
+        )
+
+    liberators[level] = frame
+    updated = dict(data)
+    updated["liberadores"] = liberators
+    reconstruir_version(updated, registros, "edición en la app")
+
+
+def usuarios_en_liberadores(data: dict[str, Any]) -> set[str]:
+    usados: set[str] = set()
+    for frame in data.get("liberadores", {}).values():
+        if isinstance(frame, pd.DataFrame) and "User" in frame.columns:
+            usados.update(
+                frame["User"].astype(str).str.strip().str.lower()
+            )
+    return usados
+
+
+def aplicar_diccionario_usuarios(
+    nuevo: pd.DataFrame,
+    registros: list[dict[str, Any]],
+) -> None:
+    data = st.session_state.get(SESSION_DATA_KEY)
+    if not isinstance(data, dict):
+        raise ValueError("No hay una versión activa.")
+    updated = dict(data)
+    updated["dic_users"] = nuevo.reset_index(drop=True)
+    reconstruir_version(updated, registros, "edición en la app")
+
+
+def comparar_diccionarios_usuarios(
+    actual: dict[str, str],
+    nuevo: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Genera los registros de Cambios entre dos diccionarios correo→cargo."""
+    registros: list[dict[str, Any]] = []
+    for correo in sorted(set(nuevo) - set(actual)):
+        registros.append(
+            registro_cambio(
+                "Usuarios-Cargos",
+                "",
+                f"{correo} · {nuevo[correo]}",
+                "Usuario agregado",
+            )
+        )
+    for correo in sorted(set(actual) - set(nuevo)):
+        registros.append(
+            registro_cambio(
+                "Usuarios-Cargos",
+                f"{correo} · {actual[correo]}",
+                "",
+                "Usuario eliminado",
+            )
+        )
+    for correo in sorted(set(actual) & set(nuevo)):
+        if actual[correo] != nuevo[correo]:
+            registros.append(
+                registro_cambio(
+                    "Usuarios-Cargos",
+                    f"{correo} · {actual[correo]}",
+                    f"{correo} · {nuevo[correo]}",
+                    "Cargo actualizado",
+                )
+            )
+    return registros
+
+
+def mapa_usuarios(frame: pd.DataFrame) -> dict[str, str]:
+    """Correo (minúsculas) → Cargo, conservando el último valor."""
+    resultado: dict[str, str] = {}
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return resultado
+    for correo, cargo in zip(frame["Correo"], frame["Cargo"]):
+        clave = clean_text(correo).lower()
+        if clave:
+            resultado[clave] = clean_text(cargo)
+    return resultado
+
+
+def frame_desde_mapa(mapa: dict[str, str]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"Correo": correo, "Cargo": cargo} for correo, cargo in mapa.items()],
+        columns=USER_DICTIONARY_COLUMNS,
+    )
+
+
+def guardar_mensaje(tipo: str, texto: str) -> None:
+    st.session_state[SESSION_EDITOR_MESSAGE_KEY] = (tipo, texto)
+
+
+def render_editor_usuarios(data: dict[str, Any]) -> None:
+    dictionary = data.get("dic_users", pd.DataFrame())
+    if not isinstance(dictionary, pd.DataFrame):
+        dictionary = pd.DataFrame(columns=USER_DICTIONARY_COLUMNS)
+    dictionary = dictionary.loc[:, USER_DICTIONARY_COLUMNS].copy()
+    actual = mapa_usuarios(dictionary)
+    usados = usuarios_en_liberadores(data)
+
+    sin_registrar = sorted(
+        correo
+        for correo in usados - set(actual)
+        if EMAIL_PATTERN.match(correo)
+    )
+    sin_cargo = sum(1 for cargo in actual.values() if not cargo)
+
+    columnas = st.columns(3)
+    columnas[0].metric("Usuarios", len(actual))
+    columnas[1].metric("Sin cargo", sin_cargo)
+    columnas[2].metric(
+        "En liberadores sin registrar",
+        len(sin_registrar),
+        help="Correos que aparecen en los liberadores pero no en este diccionario.",
+    )
+
+    if sin_registrar:
+        with st.expander(
+            f"Agregar los {len(sin_registrar)} correos de los liberadores "
+            "que no están registrados"
+        ):
+            st.write(", ".join(sin_registrar))
+            if st.button(
+                "➕ Agregarlos al diccionario (cargo por completar)",
+                key="agregar_sin_registrar_v01",
+            ):
+                nuevo = dict(actual)
+                for correo in sin_registrar:
+                    nuevo[correo] = ""
+                try:
+                    aplicar_diccionario_usuarios(
+                        frame_desde_mapa(nuevo),
+                        comparar_diccionarios_usuarios(actual, nuevo),
+                    )
+                    guardar_mensaje(
+                        "success",
+                        f"Se agregaron {len(sin_registrar)} usuarios. "
+                        "Completa su cargo en la tabla.",
+                    )
+                except (ValueError, KeyError) as error:
+                    guardar_mensaje("error", f"No se pudo agregar: {error}")
+                st.session_state[SESSION_EDITOR_COUNTER_KEY] = (
+                    st.session_state.get(SESSION_EDITOR_COUNTER_KEY, 0) + 1
+                )
+                st.rerun()
+
+    st.caption(
+        "Edita el **Cargo** con doble clic. Para **agregar** un usuario usa "
+        "la fila vacía al final de la tabla (➕) y completa Correo y Cargo. "
+        "Para **eliminar**, selecciona la fila y presiona el ícono de papelera. "
+        "Cada cambio se aplica al instante y queda en Cambios."
+    )
+
+    counter = st.session_state.get(SESSION_EDITOR_COUNTER_KEY, 0)
+    edited = st.data_editor(
+        dictionary,
+        key=f"editor_usuarios_{counter}",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "Correo": st.column_config.TextColumn(
+                "Correo ✏️",
+                help="Correo del usuario, por ejemplo nombre.apellido@enaex.com",
+            ),
+            "Cargo": st.column_config.TextColumn(
+                "Cargo ✏️",
+                help="Cargo del usuario.",
+            ),
+        },
+    )
+
+    filas_originales = [
+        (clean_text(c).lower(), clean_text(g))
+        for c, g in zip(dictionary["Correo"], dictionary["Cargo"])
+    ]
+    filas_editadas = [
+        (clean_text(c).lower(), clean_text(g))
+        for c, g in zip(edited["Correo"].tolist(), edited["Cargo"].tolist())
+    ]
+    if filas_editadas == filas_originales:
+        render_carga_masiva_usuarios(actual, counter)
+        return
+
+    conteo_original: dict[str, int] = {}
+    for correo, _ in filas_originales:
+        conteo_original[correo] = conteo_original.get(correo, 0) + 1
+    conteo_editado: dict[str, int] = {}
+
+    nuevo: dict[str, str] = {}
+    errores: list[str] = []
+    pendientes = 0
+
+    for correo_raw, cargo_raw in zip(
+        edited["Correo"].tolist(),
+        edited["Cargo"].tolist(),
+    ):
+        correo = clean_text(correo_raw).lower()
+        cargo = clean_text(cargo_raw)
+
+        if not correo:
+            if cargo:
+                pendientes += 1
+            continue
+        conteo_editado[correo] = conteo_editado.get(correo, 0) + 1
+        # Solo se valida lo nuevo: los datos que ya venían en el
+        # diccionario se conservan aunque tengan errores.
+        if correo not in actual and not EMAIL_PATTERN.match(correo):
+            errores.append(f"«{correo}» no es un correo válido")
+            continue
+        if correo in nuevo:
+            if conteo_editado[correo] > conteo_original.get(correo, 0):
+                errores.append(f"«{correo}» está repetido")
+            continue
+        if correo not in actual and not cargo:
+            # Usuario nuevo: se espera a que tenga cargo.
+            pendientes += 1
+            continue
+        nuevo[correo] = cargo
+
+    # Los usuarios nuevos que esperan cargo no cuentan como eliminados.
+    eliminados_en_uso = sorted(
+        (set(actual) - set(nuevo)) & usados
+        - {
+            clean_text(c).lower()
+            for c in edited["Correo"].tolist()
+        }
+    )
+    if eliminados_en_uso:
+        errores.append(
+            "no se puede eliminar porque está asignado en los liberadores: "
+            + ", ".join(eliminados_en_uso)
+        )
+
+    if errores:
+        guardar_mensaje(
+            "error",
+            "No se aplicó el cambio: " + "; ".join(errores) + ".",
+        )
+        st.session_state[SESSION_EDITOR_COUNTER_KEY] = counter + 1
+        st.rerun()
+
+    # Correos vigentes que siguen en la tabla pero quedaron pendientes
+    # no deben borrarse.
+    for correo in actual:
+        if correo not in nuevo and correo in {
+            clean_text(c).lower() for c in edited["Correo"].tolist()
+        }:
+            nuevo[correo] = actual[correo]
+
+    registros = comparar_diccionarios_usuarios(actual, nuevo)
+
+    if pendientes and not registros:
+        st.info(
+            "Completa **Correo y Cargo** de la fila nueva para agregar "
+            "el usuario."
+        )
+
+    if registros:
+        try:
+            aplicar_diccionario_usuarios(frame_desde_mapa(nuevo), registros)
+        except (ValueError, KeyError) as error:
+            guardar_mensaje("error", f"No se pudo aplicar el cambio: {error}")
+        else:
+            agregados = sum(
+                1 for r in registros if r["Nota"] == "Usuario agregado"
+            )
+            eliminados = sum(
+                1 for r in registros if r["Nota"] == "Usuario eliminado"
+            )
+            cargos = sum(
+                1 for r in registros if r["Nota"] == "Cargo actualizado"
+            )
+            partes = [
+                texto
+                for cantidad, texto in [
+                    (agregados, f"{agregados} agregado(s)"),
+                    (cargos, f"{cargos} cargo(s) actualizado(s)"),
+                    (eliminados, f"{eliminados} eliminado(s)"),
+                ]
+                if cantidad
+            ]
+            guardar_mensaje(
+                "success",
+                "Usuarios-Cargos: " + ", ".join(partes) + ".",
+            )
+        st.session_state[SESSION_EDITOR_COUNTER_KEY] = counter + 1
+        st.rerun()
+
+    render_carga_masiva_usuarios(actual, counter)
+
+
+def render_carga_masiva_usuarios(
+    actual: dict[str, str],
+    counter: int,
+) -> None:
+    with st.expander("📥 Cargar varios usuarios desde un archivo"):
+        st.caption(
+            "Sube un Excel o CSV con columnas **Correo** y **Cargo** "
+            "(también se aceptan Email, Mail, Usuario, Rol). Los correos "
+            "nuevos se agregan y, si un correo ya existe, se actualiza "
+            "su cargo. No se elimina a nadie."
+        )
+        archivo = st.file_uploader(
+            "Archivo de usuarios",
+            type=["csv", "xlsx", "xls", "xlsm"],
+            key=f"carga_usuarios_{counter}",
+        )
+        if archivo is not None:
+            try:
+                raw_frame, _ = read_uploaded_table(archivo)
+                cargados, _ = normalize_user_dictionary(raw_frame)
+            except ValueError as error:
+                st.error(str(error))
+                return
+
+            nuevos_archivo = mapa_usuarios(cargados)
+            invalidos = [
+                c for c in nuevos_archivo if not EMAIL_PATTERN.match(c)
+            ]
+            combinado = dict(actual)
+            for correo, cargo in nuevos_archivo.items():
+                if correo in invalidos:
+                    continue
+                if correo not in combinado or (
+                    cargo and cargo != combinado[correo]
+                ):
+                    combinado[correo] = cargo or combinado.get(correo, "")
+
+            registros_archivo = comparar_diccionarios_usuarios(
+                actual,
+                combinado,
+            )
+            agregados = sum(
+                1 for r in registros_archivo
+                if r["Nota"] == "Usuario agregado"
+            )
+            actualizados = len(registros_archivo) - agregados
+
+            if invalidos:
+                st.warning(
+                    "Se omitirán por no ser correos válidos: "
+                    + ", ".join(invalidos)
+                )
+
+            if not registros_archivo:
+                st.info("El archivo no trae usuarios nuevos ni cargos distintos.")
+            elif st.button(
+                f"Aplicar: {agregados} nuevo(s), "
+                f"{actualizados} cargo(s) actualizado(s)",
+                type="primary",
+                key=f"aplicar_carga_usuarios_{counter}",
+            ):
+                try:
+                    aplicar_diccionario_usuarios(
+                        frame_desde_mapa(combinado),
+                        registros_archivo,
+                    )
+                    guardar_mensaje(
+                        "success",
+                        f"Usuarios-Cargos: {agregados} agregado(s) y "
+                        f"{actualizados} cargo(s) actualizado(s) "
+                        "desde archivo.",
+                    )
+                except (ValueError, KeyError) as error:
+                    guardar_mensaje("error", f"No se pudo aplicar: {error}")
+                st.session_state[SESSION_EDITOR_COUNTER_KEY] = counter + 1
+                st.rerun()
 
 
 def render_editor_liberador(
@@ -2531,7 +2922,8 @@ def render_editor_liberador(
         if nuevos:
             mensaje += (
                 " Atención: " + ", ".join(nuevos)
-                + " no está en el diccionario Usuarios-Cargos."
+                + " no está en el diccionario Usuarios-Cargos. "
+                "Agrégalo con su cargo en la pestaña Usuarios-Cargos."
             )
             st.session_state[SESSION_EDITOR_MESSAGE_KEY] = ("warning", mensaje)
         else:
@@ -2915,11 +3307,7 @@ def render_active_state() -> None:
         )
 
     with tabs[6]:
-        st.dataframe(
-            data.get("dic_users", pd.DataFrame()).head(300),
-            use_container_width=True,
-            hide_index=True,
-        )
+        render_editor_usuarios(data)
 
     if changes_count:
         with tabs[7]:
