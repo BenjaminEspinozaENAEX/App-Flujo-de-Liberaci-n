@@ -156,6 +156,7 @@ SESSION_VERSION_KEY = "flujo_liberacion_version_v01"
 SESSION_EDITOR_COUNTER_KEY = "flujo_liberacion_editor_counter_v01"
 SESSION_EDITOR_MESSAGE_KEY = "flujo_liberacion_editor_message_v01"
 HISTORY_KEY_PAGE_03 = "mod_liberadores_history_v04"
+SESSION_SAVED_COUNT_KEY = "flujo_liberacion_saved_changes_v01"
 
 CHILE_TZ = ZoneInfo("America/Santiago")
 MESES_ES = [
@@ -1432,6 +1433,7 @@ def clear_active_files() -> None:
         SESSION_REMOTE_SOURCE_KEY,
         SESSION_VERSION_KEY,
         SESSION_EDITOR_MESSAGE_KEY,
+        SESSION_SAVED_COUNT_KEY,
     ]:
         st.session_state.pop(key, None)
 
@@ -2337,6 +2339,85 @@ def nombre_descarga_version(
 # EDICIÓN DE USUARIOS (USER) EN TIEMPO REAL
 # ============================================================
 
+def cambios_vigentes(data: dict[str, Any]) -> pd.DataFrame:
+    """Historial de cambios actual, incluido lo registrado en la página 03."""
+    history_03 = st.session_state.get(HISTORY_KEY_PAGE_03)
+    previous = data.get("cambios", pd.DataFrame())
+    if isinstance(history_03, list) and len(history_03) > (
+        len(previous) if isinstance(previous, pd.DataFrame) else 0
+    ):
+        previous = pd.DataFrame(history_03).reindex(columns=CHANGE_COLUMNS)
+    elif isinstance(previous, pd.DataFrame) and not previous.empty:
+        previous = dataframe_for_export(data, FILE_ROLE_CHANGES)
+    else:
+        previous = pd.DataFrame(columns=CHANGE_COLUMNS)
+    return previous.fillna("").reset_index(drop=True)
+
+
+def marcar_cambios_guardados(total_cambios: int) -> None:
+    hoy = ahora_chile()
+    st.session_state[SESSION_VERSION_KEY] = construir_info_version(
+        hoy,
+        "cambios guardados",
+    )
+    st.session_state[SESSION_SAVED_COUNT_KEY] = total_cambios
+    st.toast(
+        f"Versión {hoy:%d-%m-%Y} guardada. Reemplaza los archivos en "
+        "OneDrive con los del ZIP para que quede permanente.",
+        icon="💾",
+    )
+
+
+def render_boton_guardar(data: dict[str, Any]) -> None:
+    file_names = st.session_state.get(SESSION_FILE_KEY, {})
+    if not isinstance(file_names, dict):
+        file_names = {}
+
+    cambios = cambios_vigentes(data)
+    total = len(cambios)
+    if SESSION_SAVED_COUNT_KEY not in st.session_state:
+        st.session_state[SESSION_SAVED_COUNT_KEY] = total
+    pendientes = max(0, total - st.session_state[SESSION_SAVED_COUNT_KEY])
+
+    export_data = dict(data)
+    export_data["cambios"] = cambios
+
+    try:
+        zip_bytes = build_export_zip(
+            data=export_data,
+            file_names=file_names,
+            export_mode="source",
+        )
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    hoy = ahora_chile()
+    st.download_button(
+        f"Guardar cambios · {hoy:%d-%m-%Y}",
+        data=zip_bytes,
+        file_name=nombre_descarga_version(
+            construir_info_version(hoy, "cambios guardados")
+        ),
+        mime="application/zip",
+        icon="💾",
+        type="primary" if pendientes else "secondary",
+        use_container_width=True,
+        on_click=marcar_cambios_guardados,
+        args=(total,),
+        key="guardar_cambios_version_v01",
+        help=(
+            "Descarga la versión con la fecha de hoy y deja la app en esa "
+            "versión. Para que sea permanente, reemplaza los archivos en "
+            "OneDrive con los del ZIP (mismo nombre)."
+        ),
+    )
+    if pendientes:
+        st.caption(f"⚠️ {pendientes} cambio(s) sin guardar")
+    else:
+        st.caption("✅ Sin cambios pendientes")
+
+
 def reconstruir_version(
     updated: dict[str, Any],
     registros: list[dict[str, Any]],
@@ -2368,17 +2449,7 @@ def reconstruir_version(
             + ".csv"
         )
 
-    history_03 = st.session_state.get(HISTORY_KEY_PAGE_03)
-    previous = data.get("cambios", pd.DataFrame())
-    if isinstance(history_03, list) and len(history_03) > (
-        len(previous) if isinstance(previous, pd.DataFrame) else 0
-    ):
-        previous = pd.DataFrame(history_03).reindex(columns=CHANGE_COLUMNS)
-    elif isinstance(previous, pd.DataFrame) and not previous.empty:
-        previous = dataframe_for_export(data, FILE_ROLE_CHANGES)
-    else:
-        previous = pd.DataFrame(columns=CHANGE_COLUMNS)
-    previous = previous.fillna("")
+    previous = cambios_vigentes(data)
 
     all_changes = pd.concat(
         [previous, pd.DataFrame(registros, columns=CHANGE_COLUMNS)],
@@ -3224,21 +3295,23 @@ def render_active_state() -> None:
         ).replace(",", ".")
     )
 
-    summary_metrics = st.columns(4)
+    summary_metrics = st.columns([1, 1.3, 1, 1, 1])
     summary_metrics[0].metric(
         "Versión",
         version["fecha_corta"],
         help=version["texto_version"],
     )
-    summary_metrics[1].metric(
+    with summary_metrics[1]:
+        render_boton_guardar(data)
+    summary_metrics[2].metric(
         "Archivos activos",
         active_count,
     )
-    summary_metrics[2].metric(
+    summary_metrics[3].metric(
         "Reglas internas",
         f"{len(flow):,}".replace(",", "."),
     )
-    summary_metrics[3].metric(
+    summary_metrics[4].metric(
         "CECO",
         f"{flow['CECO'].nunique():,}".replace(",", "."),
     )
@@ -3462,6 +3535,9 @@ def main() -> None:
                 determinar_version_carga(uploaded_files)
             )
             st.session_state.pop(HISTORY_KEY_PAGE_03, None)
+            st.session_state[SESSION_SAVED_COUNT_KEY] = len(
+                data.get("cambios", pd.DataFrame())
+            )
             st.session_state[SESSION_CHANGES_KEY] = data.get(
                 "cambios",
                 pd.DataFrame(columns=CHANGE_COLUMNS),
