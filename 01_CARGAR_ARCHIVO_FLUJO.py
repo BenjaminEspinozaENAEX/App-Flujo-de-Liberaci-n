@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import importlib.util
 import re
+import threading
 import zipfile
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -385,11 +386,14 @@ class RemoteUploadedFile:
         name: str,
         raw: bytes,
         last_modified: str = "",
+        fecha_guardado: datetime | None = None,
     ):
         self.name = Path(name).name
         self._raw = bytes(raw)
         # Fecha de modificación informada por SharePoint (Last-Modified).
         self.last_modified = last_modified or ""
+        # Fecha en que se presionó "Guardar cambios" (versión guardada).
+        self.fecha_guardado = fecha_guardado
 
     def getvalue(self) -> bytes:
         return self._raw
@@ -2278,6 +2282,20 @@ def determinar_version_carga(
     2. Última modificación informada por SharePoint.
     3. Fecha y hora de la carga.
     """
+    guardadas = [
+        fecha
+        for uploaded in uploaded_files.values()
+        if isinstance(
+            fecha := getattr(uploaded, "fecha_guardado", None),
+            datetime,
+        )
+    ]
+    if guardadas:
+        return construir_info_version(
+            max(guardadas),
+            "cambios guardados en la app",
+        )
+
     names = {
         role: getattr(uploaded, "name", "")
         for role, uploaded in uploaded_files.items()
@@ -2354,16 +2372,80 @@ def cambios_vigentes(data: dict[str, Any]) -> pd.DataFrame:
     return previous.fillna("").reset_index(drop=True)
 
 
-def marcar_cambios_guardados(total_cambios: int) -> None:
+@st.cache_resource(show_spinner=False)
+def almacen_version_guardada() -> dict[str, Any]:
+    """
+    Versión guardada compartida por todas las sesiones de la app.
+    Sobrevive a recargar la página (F5) y la ven todos los usuarios,
+    hasta que la app se reinicia (por ejemplo, al actualizar el código).
+    """
+    return {"lock": threading.Lock(), "fecha": None, "zip": None}
+
+
+def obtener_version_guardada() -> tuple[datetime | None, bytes | None]:
+    almacen = almacen_version_guardada()
+    with almacen["lock"]:
+        return almacen["fecha"], almacen["zip"]
+
+
+def guardar_version_en_app(fecha: datetime, zip_bytes: bytes) -> None:
+    almacen = almacen_version_guardada()
+    with almacen["lock"]:
+        almacen["fecha"] = fecha
+        almacen["zip"] = bytes(zip_bytes)
+
+
+def descartar_version_guardada() -> None:
+    almacen = almacen_version_guardada()
+    with almacen["lock"]:
+        almacen["fecha"] = None
+        almacen["zip"] = None
+
+
+def fecha_archivos_sharepoint(
+    uploaded_files: dict[str, Any],
+) -> datetime | None:
+    fechas = [
+        fecha
+        for uploaded in uploaded_files.values()
+        if (
+            fecha := fecha_desde_last_modified(
+                getattr(uploaded, "last_modified", "")
+            )
+        )
+        is not None
+    ]
+    return max(fechas) if fechas else None
+
+
+def archivos_desde_version_guardada(
+    fecha: datetime,
+    zip_bytes: bytes,
+) -> dict[str, RemoteUploadedFile]:
+    archivos: dict[str, RemoteUploadedFile] = {}
+    with zipfile.ZipFile(BytesIO(zip_bytes)) as archive:
+        for name in archive.namelist():
+            role = detect_file_role(name)
+            if role:
+                archivos[role] = RemoteUploadedFile(
+                    name,
+                    archive.read(name),
+                    fecha_guardado=fecha,
+                )
+    return archivos
+
+
+def marcar_cambios_guardados(total_cambios: int, zip_bytes: bytes) -> None:
     hoy = ahora_chile()
+    guardar_version_en_app(hoy, zip_bytes)
     st.session_state[SESSION_VERSION_KEY] = construir_info_version(
         hoy,
-        "cambios guardados",
+        "cambios guardados en la app",
     )
     st.session_state[SESSION_SAVED_COUNT_KEY] = total_cambios
     st.toast(
-        f"Versión {hoy:%d-%m-%Y} guardada. Reemplaza los archivos en "
-        "OneDrive con los del ZIP para que quede permanente.",
+        f"Versión {hoy:%d-%m-%Y} guardada en la app. Para respaldarla "
+        "también en OneDrive, reemplaza los archivos con los del ZIP.",
         icon="💾",
     )
 
@@ -2430,7 +2512,7 @@ def render_boton_guardar(data: dict[str, Any]) -> None:
         type="primary" if pendientes else "secondary",
         use_container_width=True,
         on_click=marcar_cambios_guardados,
-        args=(total,),
+        args=(total, zip_bytes),
         key="guardar_cambios_version_v01",
         help=(
             "Descarga la versión con la fecha de hoy y deja la app en esa "
@@ -3036,6 +3118,10 @@ def render_remote_connection() -> dict[str, Any]:
         "`st.secrets[\"sharepoint_flujo\"]`."
     )
 
+    aviso = st.session_state.pop("flujo_liberacion_remote_msg_v01", None)
+    if aviso:
+        st.info(aviso)
+
     with st.form("form_remote_flujo_v02"):
         access_key = st.text_input(
             "Clave de conexión",
@@ -3063,10 +3149,27 @@ def render_remote_connection() -> dict[str, Any]:
             status.caption(message)
 
         try:
+            # Siempre se leen los archivos actuales de OneDrive.
+            descargar_archivo_remoto_cache.clear()
             remote_files = conectar_y_obtener_archivos(
                 access_key,
                 progress_callback=remote_progress,
             )
+
+            # Si en la app hay una versión guardada más reciente que la de
+            # OneDrive, se carga esa.
+            fecha_guardada, zip_guardado = obtener_version_guardada()
+            fecha_onedrive = fecha_archivos_sharepoint(remote_files)
+            if fecha_guardada is not None and zip_guardado:
+                if fecha_onedrive is None or fecha_guardada > fecha_onedrive:
+                    remote_files = archivos_desde_version_guardada(
+                        fecha_guardada,
+                        zip_guardado,
+                    )
+                else:
+                    # OneDrive ya tiene algo más nuevo: manda OneDrive.
+                    descartar_version_guardada()
+
             st.session_state[SESSION_REMOTE_FILES_KEY] = remote_files
             st.session_state[SESSION_REMOTE_SOURCE_KEY] = "sharepoint_urls"
             progress_bar.progress(
@@ -3094,7 +3197,37 @@ def render_remote_connection() -> dict[str, Any]:
             st.error(str(error))
 
     value = st.session_state.get(SESSION_REMOTE_FILES_KEY, {})
-    return value if isinstance(value, dict) else {}
+    if not isinstance(value, dict):
+        value = {}
+
+    usando_guardada = any(
+        isinstance(getattr(f, "fecha_guardado", None), datetime)
+        for f in value.values()
+    )
+    if usando_guardada:
+        fecha = max(
+            f.fecha_guardado
+            for f in value.values()
+            if isinstance(getattr(f, "fecha_guardado", None), datetime)
+        )
+        st.info(
+            f"Se cargó la versión guardada en la app el "
+            f"**{fecha_larga(fecha)} · {fecha:%H:%M}**, que es más reciente "
+            "que los archivos de OneDrive."
+        )
+        if st.button(
+            "Descartar la versión guardada y usar la de OneDrive",
+            key="descartar_version_guardada_v01",
+        ):
+            descartar_version_guardada()
+            clear_active_files()
+            st.session_state["flujo_liberacion_remote_msg_v01"] = (
+                "Versión guardada descartada. Conéctate de nuevo para "
+                "cargar los archivos de OneDrive."
+            )
+            st.rerun()
+
+    return value
 
 
 def render_uploader() -> dict[str, Any]:
