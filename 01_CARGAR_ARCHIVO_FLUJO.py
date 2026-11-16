@@ -1,4 +1,3 @@
-
 # ============================================================
 # 01_CARGAR_ARCHIVO_FLUJO
 # APP_ESTRATEGIAS_LIBERACION
@@ -31,6 +30,8 @@ import importlib.util
 import re
 import zipfile
 from datetime import datetime
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
@@ -151,6 +152,18 @@ SESSION_SOURCE_FILES_KEY = "flujo_liberacion_source_files_v06"
 SESSION_CHANGES_KEY = "flujo_liberacion_changes_v01"
 SESSION_REMOTE_FILES_KEY = "flujo_liberacion_remote_files_v01"
 SESSION_REMOTE_SOURCE_KEY = "flujo_liberacion_remote_source_v01"
+SESSION_VERSION_KEY = "flujo_liberacion_version_v01"
+SESSION_EDITOR_COUNTER_KEY = "flujo_liberacion_editor_counter_v01"
+SESSION_EDITOR_MESSAGE_KEY = "flujo_liberacion_editor_message_v01"
+HISTORY_KEY_PAGE_03 = "mod_liberadores_history_v04"
+
+CHILE_TZ = ZoneInfo("America/Santiago")
+MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+    "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+NOMBRE_DESCARGA = "Flujo de Liberacion Estrategias ENAEX"
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ============================================================
@@ -366,9 +379,16 @@ def liberator_from_row(row: pd.Series) -> str:
 
 class RemoteUploadedFile:
     """Adaptador mínimo compatible con read_uploaded_table."""
-    def __init__(self, name: str, raw: bytes):
+    def __init__(
+        self,
+        name: str,
+        raw: bytes,
+        last_modified: str = "",
+    ):
         self.name = Path(name).name
         self._raw = bytes(raw)
+        # Fecha de modificación informada por SharePoint (Last-Modified).
+        self.last_modified = last_modified or ""
 
     def getvalue(self) -> bytes:
         return self._raw
@@ -721,7 +741,7 @@ def descargar_archivo_remoto_cache(
     auth: tuple[str, str] | None,
     timeout_seconds: int,
     verify_ssl: bool,
-) -> tuple[str, bytes]:
+) -> tuple[str, bytes, str]:
     response = requests.get(
         preparar_url_descarga(url),
         headers=dict(headers_items),
@@ -734,8 +754,9 @@ def descargar_archivo_remoto_cache(
     expected_host = urlparse(url).hostname or ""
     validar_respuesta_remota(response, expected_host)
     file_name = detectar_nombre_archivo_remoto(response)
+    last_modified = response.headers.get("Last-Modified", "")
 
-    return file_name, response.content
+    return file_name, response.content, last_modified
 
 
 def conectar_y_obtener_archivos(
@@ -763,7 +784,7 @@ def conectar_y_obtener_archivos(
                 f"Descargando archivo {index} de {total}...",
             )
 
-        file_name, raw = descargar_archivo_remoto_cache(
+        file_name, raw, last_modified = descargar_archivo_remoto_cache(
             url=url,
             headers_items=tuple(sorted(headers.items())),
             auth=auth,
@@ -779,7 +800,11 @@ def conectar_y_obtener_archivos(
                 f"{role_label(role)}. Revisa sus nombres."
             )
 
-        uploaded[role] = RemoteUploadedFile(file_name, raw)
+        uploaded[role] = RemoteUploadedFile(
+            file_name,
+            raw,
+            last_modified,
+        )
         downloaded_names.append(file_name)
 
         if progress_callback is not None:
@@ -1228,21 +1253,56 @@ def display_bound(value: float, *, high: bool) -> int | float:
 def reconstruct_flow(
     level_frames: dict[int, pd.DataFrame],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Reconstruye el flujo indexando cada nivel una sola vez.
+    Mismo resultado que la versión original, pero sin filtrar el
+    DataFrame completo por cada regla (de ~25 s a menos de 1 s).
+    """
     rule_keys: set[tuple[str, str, float, float]] = set()
 
-    explicit_by_level: dict[int, pd.DataFrame] = {}
+    # nivel -> (CECO, TipoDoc, Desde, Hasta) -> [(CompanyCode, Liberador)]
+    index_by_level: dict[
+        int,
+        dict[tuple[Any, Any, Any, Any], list[tuple[Any, Any]]],
+    ] = {}
 
-    for level, frame in level_frames.items():
+    for level in LEVELS:
+        frame = level_frames.get(level, pd.DataFrame())
+        level_index: dict[
+            tuple[Any, Any, Any, Any],
+            list[tuple[Any, Any]],
+        ] = {}
+        index_by_level[level] = level_index
+
+        if frame is None or frame.empty:
+            continue
+
         explicit = frame[
             frame["CostCenter"].ne("")
             & frame["CostCenter"].ne("*")
             & frame["cus_POClasedeDocumento"].isin(DOC_TYPES)
-        ].copy()
+        ]
 
-        explicit_by_level[level] = explicit
-
-        for _, row in explicit.iterrows():
-            rule_keys.add(canonical_rule_key(row))
+        for ceco_raw, doc_raw, low, high, company, liberator in zip(
+            explicit["CostCenter"],
+            explicit["cus_POClasedeDocumento"],
+            explicit["_DesdeNum"],
+            explicit["_HastaNum"],
+            explicit["CompanyCode"],
+            explicit["_Liberador"],
+        ):
+            rule_keys.add(
+                (
+                    clean_text(ceco_raw),
+                    clean_text(doc_raw).upper(),
+                    float(low),
+                    float(high),
+                )
+            )
+            level_index.setdefault(
+                (ceco_raw, doc_raw, low, high),
+                [],
+            ).append((company, liberator))
 
     records: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
@@ -1264,24 +1324,23 @@ def reconstruct_flow(
         expected_company = company_from_ceco(ceco)
 
         for level in LEVELS:
-            level_rows = explicit_by_level[level]
-            matches = level_rows[
-                level_rows["CostCenter"].eq(ceco)
-                & level_rows["cus_POClasedeDocumento"].eq(doc)
-                & level_rows["_DesdeNum"].eq(low)
-                & level_rows["_HastaNum"].eq(high)
-            ].copy()
+            matches = index_by_level[level].get(
+                (ceco, doc, low, high),
+                [],
+            )
 
             if expected_company:
-                preferred = matches[
-                    matches["CompanyCode"].isin({expected_company, "*", ""})
+                preferred = [
+                    item
+                    for item in matches
+                    if item[0] in {expected_company, "*", ""}
                 ]
-                if not preferred.empty:
+                if preferred:
                     matches = preferred
 
             values = [
                 value
-                for value in matches["_Liberador"].map(clean_text).tolist()
+                for value in (clean_text(item[1]) for item in matches)
                 if value
             ]
 
@@ -1371,6 +1430,8 @@ def clear_active_files() -> None:
         SESSION_CHANGES_KEY,
         SESSION_REMOTE_FILES_KEY,
         SESSION_REMOTE_SOURCE_KEY,
+        SESSION_VERSION_KEY,
+        SESSION_EDITOR_MESSAGE_KEY,
     ]:
         st.session_state.pop(key, None)
 
@@ -1798,6 +1859,22 @@ def export_file_name(
     return f"{stem}{extension}"
 
 
+def nombre_exportacion(
+    role: str,
+    extension: str,
+    file_names: dict[str, str],
+) -> str:
+    """
+    Conserva el nombre con que se cargó cada archivo para poder
+    reemplazarlo en SharePoint sin romper su vínculo.
+    """
+    original = clean_text(file_names.get(role, ""))
+    stem = Path(original).stem if original else ""
+    if not stem or stem.endswith("_vacio"):
+        return export_file_name(role, extension)
+    return f"{stem}{extension}"
+
+
 def build_export_zip(
     data: dict[str, Any],
     file_names: dict[str, str],
@@ -1848,7 +1925,7 @@ def build_export_zip(
                 )
 
             archive.writestr(
-                export_file_name(role, extension),
+                nombre_exportacion(role, extension, file_names),
                 content,
             )
 
@@ -1943,8 +2020,8 @@ def render_export_section(data: dict[str, Any]) -> None:
     st.download_button(
         "⬇️ Descargar ZIP con los 7 archivos",
         data=zip_bytes,
-        file_name=(
-            f"VERSION_LIBERADORES_{mode_label}_{timestamp}.zip"
+        file_name=nombre_descarga_version(
+            version_activa(file_names)
         ),
         mime="application/zip",
         type="primary",
@@ -2151,6 +2228,317 @@ def obtener_version_archivos_activos(
         "texto_version": version_date.strftime("%d-%m-%Y %H:%M:%S"),
         "fecha_corta": version_date.strftime("%d-%m-%Y"),
     }
+
+
+# ============================================================
+# VERSIÓN POR FECHA
+# ============================================================
+
+def ahora_chile() -> datetime:
+    return datetime.now(CHILE_TZ).replace(tzinfo=None)
+
+
+def fecha_larga(fecha: datetime) -> str:
+    return f"{fecha.day} de {MESES_ES[fecha.month - 1]} de {fecha.year}"
+
+
+def construir_info_version(
+    fecha: datetime,
+    origen: str,
+) -> dict[str, Any]:
+    return {
+        "version_detectada": True,
+        "fecha_version": fecha,
+        "texto_version": f"{fecha_larga(fecha)} · {fecha:%H:%M}",
+        "fecha_corta": fecha.strftime("%d-%m-%Y"),
+        "origen": origen,
+    }
+
+
+def fecha_desde_last_modified(valor: str) -> datetime | None:
+    try:
+        fecha = parsedate_to_datetime(clean_text(valor))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if fecha is None:
+        return None
+    if fecha.tzinfo is not None:
+        fecha = fecha.astimezone(CHILE_TZ).replace(tzinfo=None)
+    return fecha
+
+
+def determinar_version_carga(
+    uploaded_files: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Fecha de la versión, en este orden de prioridad:
+    1. Sello de fecha en el nombre de los archivos.
+    2. Última modificación informada por SharePoint.
+    3. Fecha y hora de la carga.
+    """
+    names = {
+        role: getattr(uploaded, "name", "")
+        for role, uploaded in uploaded_files.items()
+    }
+    por_nombre = obtener_version_archivos_activos(names)
+    if por_nombre.get("version_detectada"):
+        return construir_info_version(
+            por_nombre["fecha_version"],
+            "fecha indicada en el nombre de los archivos",
+        )
+
+    fechas = [
+        fecha
+        for uploaded in uploaded_files.values()
+        if (
+            fecha := fecha_desde_last_modified(
+                getattr(uploaded, "last_modified", "")
+            )
+        )
+        is not None
+    ]
+    if fechas:
+        return construir_info_version(
+            max(fechas),
+            "última modificación de los archivos en SharePoint",
+        )
+
+    return construir_info_version(ahora_chile(), "fecha de carga")
+
+
+def version_activa(file_names: dict[str, str]) -> dict[str, Any]:
+    guardada = st.session_state.get(SESSION_VERSION_KEY)
+    if isinstance(guardada, dict) and guardada.get("fecha_version"):
+        return guardada
+
+    por_nombre = obtener_version_archivos_activos(file_names)
+    if por_nombre.get("version_detectada"):
+        return construir_info_version(
+            por_nombre["fecha_version"],
+            "fecha indicada en el nombre de los archivos",
+        )
+
+    info = construir_info_version(ahora_chile(), "fecha de carga")
+    st.session_state[SESSION_VERSION_KEY] = info
+    return info
+
+
+def nombre_descarga_version(
+    info: dict[str, Any],
+    extension: str = ".zip",
+) -> str:
+    fecha = info.get("fecha_version")
+    if not isinstance(fecha, datetime):
+        fecha = ahora_chile()
+    return f"Version {fecha_larga(fecha)} - {NOMBRE_DESCARGA}{extension}"
+
+
+# ============================================================
+# EDICIÓN DE USUARIOS (USER) EN TIEMPO REAL
+# ============================================================
+
+def aplicar_edicion_usuarios(
+    level: int,
+    ediciones: list[tuple[Any, str, str]],
+) -> None:
+    """
+    Aplica cambios de la columna User y reconstruye la versión completa
+    con las mismas validaciones de la carga. Registra cada cambio
+    en el archivo de Cambios.
+    """
+    data = st.session_state.get(SESSION_DATA_KEY)
+    if not isinstance(data, dict):
+        raise ValueError("No hay una versión activa.")
+
+    original_names = dict(
+        st.session_state.get(SESSION_FILE_KEY, {}) or {}
+    )
+    names = dict(original_names)
+
+    liberators = dict(data.get("liberadores", {}))
+    frame = liberators[level].copy()
+    fecha = ahora_chile()
+    registros: list[dict[str, Any]] = []
+
+    for index, antes, despues in ediciones:
+        row = frame.loc[index]
+        frame.at[index, "User"] = despues
+        registros.append(
+            {
+                "FechaHora": fecha.strftime("%d-%m-%Y %H:%M:%S"),
+                "Usuario": "Edición directa en la app",
+                "CECO": clean_text(row.get("CostCenter", "")),
+                "Desde": clean_text(row.get("TotalCost Bajo", "")),
+                "Hasta": clean_text(row.get("TotalCost Alto", "")),
+                "TipoDoc": clean_text(
+                    row.get("cus_POClasedeDocumento", "")
+                ),
+                "Campo": f"Liberador {level}",
+                "ValorAntes": antes,
+                "ValorDespues": despues,
+                "Nota": "Cambio de usuario liberador",
+            }
+        )
+
+    liberators[level] = frame
+    updated = dict(data)
+    updated["liberadores"] = liberators
+
+    # Se parte siempre de la versión vigente en memoria (incluye lo
+    # modificado en la página 03), no de los archivos originales.
+    sources: dict[str, bytes] = {}
+    for role in REQUIRED_FILE_ROLES:
+        sources[role] = (
+            dataframe_for_export(updated, role)
+            .to_csv(index=False)
+            .encode("utf-8")
+        )
+        names[role] = (
+            Path(names.get(role) or export_file_name(role, ".csv")).stem
+            + ".csv"
+        )
+
+    history_03 = st.session_state.get(HISTORY_KEY_PAGE_03)
+    previous = data.get("cambios", pd.DataFrame())
+    if isinstance(history_03, list) and len(history_03) > (
+        len(previous) if isinstance(previous, pd.DataFrame) else 0
+    ):
+        previous = pd.DataFrame(history_03).reindex(columns=CHANGE_COLUMNS)
+    elif isinstance(previous, pd.DataFrame) and not previous.empty:
+        previous = dataframe_for_export(data, FILE_ROLE_CHANGES)
+    else:
+        previous = pd.DataFrame(columns=CHANGE_COLUMNS)
+    previous = previous.fillna("")
+    all_changes = pd.concat(
+        [previous, pd.DataFrame(registros, columns=CHANGE_COLUMNS)],
+        ignore_index=True,
+    )
+    sources[FILE_ROLE_CHANGES] = (
+        all_changes.to_csv(index=False).encode("utf-8")
+    )
+    names[FILE_ROLE_CHANGES] = (
+        Path(names.get(FILE_ROLE_CHANGES) or "Cambios").stem + ".csv"
+    )
+
+    uploaded = {
+        current_role: RemoteUploadedFile(
+            names.get(current_role) or export_file_name(current_role, ".csv"),
+            raw,
+        )
+        for current_role, raw in sources.items()
+    }
+
+    new_data, new_sources, validation = load_seven_files(uploaded)
+
+    st.session_state[SESSION_DATA_KEY] = new_data
+    # Se conservan los nombres originales (y su extensión) para que la
+    # descarga pueda reemplazar los archivos en SharePoint.
+    st.session_state[SESSION_FILE_KEY] = {
+        current_role: (
+            original_names.get(current_role) or uploaded_file.name
+        )
+        for current_role, uploaded_file in uploaded.items()
+    }
+    st.session_state[SESSION_SOURCE_FILES_KEY] = new_sources
+    st.session_state[SESSION_FILE_BYTES_KEY] = new_sources
+    st.session_state[SESSION_VALIDATION_KEY] = validation
+    st.session_state[SESSION_CHANGES_KEY] = new_data.get(
+        "cambios",
+        pd.DataFrame(columns=CHANGE_COLUMNS),
+    )
+    st.session_state[SESSION_VERSION_KEY] = construir_info_version(
+        fecha,
+        "edición en la app",
+    )
+    st.session_state.pop(SESSION_CASE_KEY, None)
+
+
+def render_editor_liberador(
+    level: int,
+    frame: pd.DataFrame,
+    known_users: set[str],
+) -> None:
+    visible = frame.drop(
+        columns=["_DesdeNum", "_HastaNum", "_Nivel", "_Liberador"],
+        errors="ignore",
+    )
+
+    if visible.empty:
+        st.info(f"Liberador {level} no tiene reglas en esta versión.")
+        return
+
+    st.caption(
+        "Haz doble clic en una celda de **User** para cambiar el "
+        "liberador. El cambio se aplica al instante en toda la app "
+        "y queda registrado en Cambios."
+    )
+
+    counter = st.session_state.get(SESSION_EDITOR_COUNTER_KEY, 0)
+    edited = st.data_editor(
+        visible,
+        key=f"editor_liberador_{level}_{counter}",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=[column for column in visible.columns if column != "User"],
+        column_config={
+            "User": st.column_config.TextColumn(
+                "User ✏️",
+                help="Correo del liberador. Editable.",
+            )
+        },
+    )
+
+    ediciones: list[tuple[Any, str, str]] = []
+    invalidos: list[str] = []
+    for index in visible.index:
+        antes = clean_text(visible.at[index, "User"])
+        despues = clean_text(edited.at[index, "User"]).lower()
+        if despues == antes.lower():
+            continue
+        if not EMAIL_PATTERN.match(despues):
+            invalidos.append(despues or "(vacío)")
+            continue
+        ediciones.append((index, antes, despues))
+
+    if invalidos:
+        st.session_state[SESSION_EDITOR_COUNTER_KEY] = counter + 1
+        st.session_state[SESSION_EDITOR_MESSAGE_KEY] = (
+            "error",
+            "No se aplicó el cambio: "
+            + ", ".join(invalidos)
+            + " no es un correo válido.",
+        )
+        st.rerun()
+
+    if not ediciones:
+        return
+
+    try:
+        aplicar_edicion_usuarios(level, ediciones)
+    except (ValueError, KeyError) as error:
+        st.session_state[SESSION_EDITOR_MESSAGE_KEY] = (
+            "error",
+            f"No se pudo aplicar el cambio: {error}",
+        )
+    else:
+        nuevos = sorted(
+            {despues for _, _, despues in ediciones} - known_users
+        )
+        mensaje = (
+            f"Liberador {level}: {len(ediciones)} cambio(s) aplicado(s)."
+        )
+        if nuevos:
+            mensaje += (
+                " Atención: " + ", ".join(nuevos)
+                + " no está en el diccionario Usuarios-Cargos."
+            )
+            st.session_state[SESSION_EDITOR_MESSAGE_KEY] = ("warning", mensaje)
+        else:
+            st.session_state[SESSION_EDITOR_MESSAGE_KEY] = ("success", mensaje)
+
+    st.session_state[SESSION_EDITOR_COUNTER_KEY] = counter + 1
+    st.rerun()
 
 
 def render_remote_connection() -> dict[str, Any]:
@@ -2429,7 +2817,7 @@ def render_active_state() -> None:
     file_names = st.session_state.get(SESSION_FILE_KEY, {})
     if not isinstance(file_names, dict):
         file_names = {}
-    version = obtener_version_archivos_activos(file_names)
+    version = version_activa(file_names)
 
     st.success(
         (
@@ -2464,7 +2852,8 @@ def render_active_state() -> None:
     )
 
     st.caption(
-        f"Fecha y hora de la versión: **{version['texto_version']}**"
+        f"Versión del **{version['texto_version']}** "
+        f"· según {version.get('origen', 'fecha de carga')}"
     )
 
     metrics = st.columns(5)
@@ -2495,21 +2884,27 @@ def render_active_state() -> None:
 
     tabs = st.tabs(tab_labels)
 
+    mensaje = st.session_state.pop(SESSION_EDITOR_MESSAGE_KEY, None)
+    if mensaje:
+        tipo, texto = mensaje
+        getattr(st, tipo, st.info)(texto)
+
+    users_dictionary = data.get("dic_users", pd.DataFrame())
+    known_users = (
+        set(
+            users_dictionary["Correo"].astype(str).str.strip().str.lower()
+        )
+        if isinstance(users_dictionary, pd.DataFrame)
+        and "Correo" in users_dictionary.columns
+        else set()
+    )
+
     for level, tab in zip(LEVELS, tabs[:5]):
         with tab:
-            frame = liberators.get(level, pd.DataFrame())
-            st.dataframe(
-                frame.drop(
-                    columns=[
-                        "_DesdeNum",
-                        "_HastaNum",
-                        "_Nivel",
-                        "_Liberador",
-                    ],
-                    errors="ignore",
-                ).head(200),
-                use_container_width=True,
-                hide_index=True,
+            render_editor_liberador(
+                level,
+                liberators.get(level, pd.DataFrame()),
+                known_users,
             )
 
     with tabs[5]:
@@ -2675,6 +3070,10 @@ def main() -> None:
             st.session_state[SESSION_FILE_BYTES_KEY] = source_bytes
             st.session_state[SESSION_SIGNATURE_KEY] = signature
             st.session_state[SESSION_VALIDATION_KEY] = validation
+            st.session_state[SESSION_VERSION_KEY] = (
+                determinar_version_carga(uploaded_files)
+            )
+            st.session_state.pop(HISTORY_KEY_PAGE_03, None)
             st.session_state[SESSION_CHANGES_KEY] = data.get(
                 "cambios",
                 pd.DataFrame(columns=CHANGE_COLUMNS),
